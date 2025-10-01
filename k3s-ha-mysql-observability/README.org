@@ -1,0 +1,250 @@
+* K3s HA MySQL Observability: Step-by-Step Tutorial
+
+This guide walks you through deploying a two-node K3s cluster, a highly available MySQL database (using Percona XtraDB Cluster operator), and a full observability stack (Prometheus, Grafana, MySQL Exporter) with Traefik Ingress. All YAMLs are included for copy-paste or direct use.
+
+** Prerequisites
+- Two Linux nodes (VMs or bare metal)
+- SSH access and sudo privileges
+- Open ports: 6443 (K3s API), 3306 (MySQL), 8472/UDP (Flannel), 10250 (Kubelet)
+- (Optional) A domain or static IPs for external access
+
+** 1. K3s Cluster Setup
+*** On Master Node
+#+BEGIN_SRC shell
+curl -sfL https://get.k3s.io | sh -
+sudo cat /var/lib/rancher/k3s/server/node-token
+#+END_SRC
+*** On Worker Node
+#+BEGIN_SRC shell
+curl -sfL https://get.k3s.io | K3S_URL=https://<MASTER_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -
+#+END_SRC
+*** Validate Cluster
+#+BEGIN_SRC shell
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes
+#+END_SRC
+
+** 2. Install Helm
+#+BEGIN_SRC shell
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+#+END_SRC
+
+** 3. Deploy Percona XtraDB Cluster Operator
+#+BEGIN_SRC shell
+kubectl create namespace database
+helm repo add percona https://percona.github.io/percona-helm-charts/
+helm repo update
+helm install pxc-operator percona/pxc-operator --namespace database
+#+END_SRC
+
+** 4. Deploy Highly Available MySQL Cluster
+Create `ha-mysql.yaml`:
+#+BEGIN_SRC yaml :tangle ha-mysql.yaml
+apiVersion: pxc.percona.com/v1-9-0
+kind: PerconaXtraDBCluster
+metadata:
+  name: ha-mysql
+  namespace: database
+spec:
+  crVersion: 1.9.0
+  secretsName: my-cluster-secrets
+  sslSecretName: my-cluster-ssl
+  pxc:
+    size: 3
+    image: percona/percona-xtradb-cluster:8.0.32-24.1
+    resources:
+      requests:
+        memory: 1G
+        cpu: 600m
+      limits:
+        memory: 2G
+        cpu: 1
+    volumeSpec:
+      persistentVolumeClaim:
+        storageClassName: local-path
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 10Gi
+  haproxy:
+    enabled: true
+    size: 2
+    image: percona/percona-xtradb-cluster-operator:1.9.0-haproxy
+    resources:
+      requests:
+        memory: 500Mi
+        cpu: 300m
+      limits:
+        memory: 1G
+        cpu: 600m
+  backup:
+    enabled: false
+    image: percona/percona-xtradb-cluster-operator:1.9.0-pxc8.0-backup
+  pmm:
+    enabled: false
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f ha-mysql.yaml
+#+END_SRC
+
+** 5. Expose MySQL Service
+#+BEGIN_SRC shell
+kubectl -n database edit service ha-mysql-haproxy
+# Change type: ClusterIP -> NodePort or LoadBalancer
+#+END_SRC
+
+** 6. Deploy kube-prometheus-stack (Prometheus, Grafana, Alertmanager)
+#+BEGIN_SRC shell
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring
+#+END_SRC
+
+** 7. Expose Grafana via Traefik Ingress
+Create `grafana-ingress.yaml`:
+#+BEGIN_SRC yaml :tangle grafana-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - host: grafana.<your-domain-or-ip>.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: monitoring-grafana
+            port:
+              number: 80
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f grafana-ingress.yaml
+#+END_SRC
+
+** 8. Deploy MySQL Exporter (Standalone)
+Create `mysql-exporter-standalone.yaml`:
+#+BEGIN_SRC yaml :tangle mysql-exporter-standalone.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mysql-exporter
+  namespace: database
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mysql-exporter
+  namespace: database
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mysql-exporter
+  namespace: database
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mysql-exporter
+subjects:
+- kind: ServiceAccount
+  name: mysql-exporter
+  namespace: database
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-exporter
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-exporter
+  template:
+    metadata:
+      labels:
+        app: mysql-exporter
+    spec:
+      serviceAccountName: mysql-exporter
+      containers:
+      - name: mysql-exporter
+        image: prom/mysqld-exporter:v0.14.0
+        env:
+        - name: DATA_SOURCE_NAME
+          valueFrom:
+            secretKeyRef:
+              name: my-cluster-secrets
+              key: root
+        ports:
+        - containerPort: 9104
+          name: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-exporter
+  namespace: database
+  labels:
+    app: mysql-exporter
+spec:
+  ports:
+  - name: metrics
+    port: 9104
+    targetPort: 9104
+  selector:
+    app: mysql-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mysql-exporter
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: mysql-exporter
+  namespaceSelector:
+    matchNames:
+      - database
+  endpoints:
+    - port: metrics
+      interval: 30s
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f mysql-exporter-standalone.yaml
+#+END_SRC
+
+** 9. Import MySQL Dashboard in Grafana
+- Open Grafana at http://grafana.<your-domain-or-ip>.nip.io
+- Login (default: admin/admin or get password from secret)
+- Go to Dashboards → Import
+- Use dashboard ID `7362` or `14057` for MySQL
+- Select Prometheus as the datasource
+
+** 10. Troubleshooting
+- Check exporter pod logs:
+  #+BEGIN_SRC shell
+  kubectl -n database logs deployment/mysql-exporter
+  #+END_SRC
+- Check Prometheus targets in the UI (should be UP)
+- Port-forward to exporter and check /metrics:
+  #+BEGIN_SRC shell
+  kubectl -n database port-forward svc/mysql-exporter 9104:9104
+  #+END_SRC
+  Then visit http://localhost:9104/metrics
+
+* All-in-one YAMLs
+- See `ha-mysql.yaml`, `grafana-ingress.yaml`, and `mysql-exporter-standalone.yaml` in this directory for direct use or modification.

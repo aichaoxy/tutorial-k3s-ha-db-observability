@@ -1,0 +1,42 @@
+apiVersion: pxc.percona.com/v1-9-0
+kind: PerconaXtraDBCluster
+metadata:
+  name: ha-mysql
+  namespace: database
+spec:
+  crVersion: 1.9.0
+  secretsName: my-cluster-secrets
+  sslSecretName: my-cluster-ssl
+  pxc:
+    size: 3
+    image: percona/percona-xtradb-cluster:8.0.32-24.1
+    resources:
+      requests:
+        memory: 1G
+        cpu: 600m
+      limits:
+        memory: 2G
+        cpu: 1
+    volumeSpec:
+      persistentVolumeClaim:
+        storageClassName: local-path
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 10Gi
+  haproxy:
+    enabled: true
+    size: 2
+    image: percona/percona-xtradb-cluster-operator:1.9.0-haproxy
+    resources:
+      requests:
+        memory: 500Mi
+        cpu: 300m
+      limits:
+        memory: 1G
+        cpu: 600m
+  backup:
+    enabled: false
+    image: percona/percona-xtradb-cluster-operator:1.9.0-pxc8.0-backup
+  pmm:
+    enabled: false

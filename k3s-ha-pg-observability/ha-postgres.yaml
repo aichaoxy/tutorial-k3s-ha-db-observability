@@ -1,0 +1,21 @@
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: ha-db
+  namespace: database
+spec:
+  teamId: "ha"
+  volume:
+    size: 10Gi
+    storageClass: "local-path"
+  numberOfInstances: 2
+  postgresql:
+    version: "15"
+  users:
+    appuser:
+      - superuser
+      - createdb
+  databases:
+    appdb: appuser
+  allowedSourceRanges:
+    - 0.0.0.0/0

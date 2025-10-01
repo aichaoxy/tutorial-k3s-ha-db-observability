@@ -1,0 +1,236 @@
+* K3s HA PostgreSQL Observability: Step-by-Step Tutorial
+
+This guide walks you through deploying a two-node K3s cluster, a highly available PostgreSQL database (Zalando operator), and a full observability stack (Prometheus, Grafana, Postgres Exporter) with Traefik Ingress. All YAMLs are included for copy-paste or direct use.
+
+** Prerequisites
+- Two Linux nodes (VMs or bare metal)
+- SSH access and sudo privileges
+- Open ports: 6443 (K3s API), 5432 (Postgres), 8472/UDP (Flannel), 10250 (Kubelet)
+- (Optional) A domain or static IPs for external access
+
+** 1. K3s Cluster Setup
+*** On Master Node
+#+BEGIN_SRC shell
+curl -sfL https://get.k3s.io | sh -
+sudo cat /var/lib/rancher/k3s/server/node-token
+#+END_SRC
+*** On Worker Node
+#+BEGIN_SRC shell
+curl -sfL https://get.k3s.io | K3S_URL=https://<MASTER_IP>:6443 K3S_TOKEN=<NODE_TOKEN> sh -
+#+END_SRC
+*** Validate Cluster
+#+BEGIN_SRC shell
+kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes
+#+END_SRC
+
+** 2. Install Helm
+#+BEGIN_SRC shell
+curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+#+END_SRC
+
+** 3. Deploy PostgreSQL Operator (Zalando)
+#+BEGIN_SRC shell
+helm repo add postgres-operator-charts https://opensource.zalando.com/postgres-operator/charts/postgres-operator
+helm repo update
+kubectl create namespace database
+helm install postgres-operator postgres-operator-charts/postgres-operator --namespace database
+#+END_SRC
+
+** 4. Deploy Highly Available PostgreSQL Cluster
+Create `ha-postgres.yaml`:
+#+BEGIN_SRC yaml :tangle ha-postgres.yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: ha-db
+  namespace: database
+spec:
+  teamId: "ha"
+  volume:
+    size: 10Gi
+    storageClass: "local-path"
+  numberOfInstances: 2
+  postgresql:
+    version: "15"
+  users:
+    appuser:
+      - superuser
+      - createdb
+  databases:
+    appdb: appuser
+  allowedSourceRanges:
+    - 0.0.0.0/0
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f ha-postgres.yaml
+#+END_SRC
+
+** 5. Expose PostgreSQL Service
+#+BEGIN_SRC shell
+kubectl -n database edit service ha-db
+# Change type: ClusterIP -> NodePort or LoadBalancer
+#+END_SRC
+
+** 6. Deploy kube-prometheus-stack (Prometheus, Grafana, Alertmanager)
+#+BEGIN_SRC shell
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack --namespace monitoring
+#+END_SRC
+
+** 7. Expose Grafana via Traefik Ingress
+Create `grafana-ingress.yaml`:
+#+BEGIN_SRC yaml :tangle grafana-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: traefik
+spec:
+  rules:
+  - host: grafana.<your-domain-or-ip>.nip.io
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: monitoring-grafana
+            port:
+              number: 80
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f grafana-ingress.yaml
+#+END_SRC
+
+** 8. Deploy Postgres Exporter (Standalone)
+Create `postgres-exporter-standalone.yaml`:
+#+BEGIN_SRC yaml :tangle postgres-exporter-standalone.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-exporter
+  namespace: database
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: postgres-exporter
+  namespace: database
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: postgres-exporter
+  namespace: database
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: postgres-exporter
+subjects:
+- kind: ServiceAccount
+  name: postgres-exporter
+  namespace: database
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter
+    spec:
+      serviceAccountName: postgres-exporter
+      containers:
+      - name: postgres-exporter
+        image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+        env:
+        - name: DATA_SOURCE_URI
+          value: "ha-db.database.svc.cluster.local:5432/appdb?sslmode=require"
+        - name: DATA_SOURCE_USER
+          valueFrom:
+            secretKeyRef:
+              name: appuser.ha-db.credentials.postgresql.acid.zalan.do
+              key: username
+        - name: DATA_SOURCE_PASS
+          valueFrom:
+            secretKeyRef:
+              name: appuser.ha-db.credentials.postgresql.acid.zalan.do
+              key: password
+        ports:
+        - containerPort: 9187
+          name: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter
+  namespace: database
+  labels:
+    app: postgres-exporter
+spec:
+  ports:
+  - name: metrics
+    port: 9187
+    targetPort: 9187
+  selector:
+    app: postgres-exporter
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: postgres-exporter
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: postgres-exporter
+  namespaceSelector:
+    matchNames:
+      - database
+  endpoints:
+    - port: metrics
+      interval: 30s
+#+END_SRC
+#+BEGIN_SRC shell
+kubectl apply -f postgres-exporter-standalone.yaml
+#+END_SRC
+
+** 9. Import PostgreSQL Dashboard in Grafana
+- Open Grafana at http://grafana.<your-domain-or-ip>.nip.io
+- Login (default: admin/admin or get password from secret)
+- Go to Dashboards → Import
+- Use dashboard ID `9628` or `9629` for PostgreSQL
+- Select Prometheus as the datasource
+
+** 10. Troubleshooting
+- Check exporter pod logs:
+  #+BEGIN_SRC shell
+  kubectl -n database logs deployment/postgres-exporter
+  #+END_SRC
+- Check Prometheus targets in the UI (should be UP)
+- Port-forward to exporter and check /metrics:
+  #+BEGIN_SRC shell
+  kubectl -n database port-forward svc/postgres-exporter 9187:9187
+  #+END_SRC
+  Then visit http://localhost:9187/metrics
+
+* All-in-one YAMLs
+- See `ha-postgres.yaml`, `grafana-ingress.yaml`, and `postgres-exporter-standalone.yaml` in this directory for direct use or modification.
